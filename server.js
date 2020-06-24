@@ -5,11 +5,15 @@ const { posts, lookup } = require('./db');
 const bodyParser = require('body-parser');
 const scrapeIt = require('scrape-it');
 const express = require('express');
+const fs = require('fs-extra');
 const path = require('path');
 const esc = require('escape-string-regexp');
 const indexer = require('./indexer');
 const getUrls = require('get-urls');
 const proxy = require('./proxy');
+const sharp = require('sharp');
+posts.createIndex({ title: 'text', content: 'text' });
+sharp.cache(false);
 indexer();
 
 const staticOpts = {
@@ -22,20 +26,50 @@ express()
   .use(bodyParser.json())
   .use(express.static('public', {
     extensions: ['html', 'htm'],
-    setHeaders: (res) => res.setHeader('Cache-Control', 's-maxage=1, stale-while-revalidate=2592000')
+    setHeaders: (res) => res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate=2592000')
   }))
+  .get('/thumbnail/*', async (req, res) => {
+    const file = `${process.env.DB_ROOT}/${req.params[0]}`;
+    const resizer = sharp({ failOnError: false, sequentialRead: true })
+      .jpeg()
+      .resize({ width: Number(req.query.size) <= 800 ? Number(req.query.size) : 800, withoutEnlargement: true })
+      .on('error', err => {
+        switch (err.message) {
+          case 'Input buffer contains unsupported image format': {
+            // stream down the original image if cannot be resized
+            fs.createReadStream(file)
+              .pipe(res);
+            break;
+          }
+          default: {
+            console.error(`${err.stack}: ${file}`);
+          }
+        }
+      });
+    const fileExists = await fs.pathExists(file);
+    if (!fileExists || !(/\.(gif|jpe?g|png|webp|Untitled)$/i).test(file)) return res.sendStatus(404);
+    res.setHeader('Cache-Control', 'max-age=31557600, public');
+    fs.createReadStream(file)
+      .pipe(resizer)
+      .pipe(res);
+  })
   .use('/files', express.static(`${process.env.DB_ROOT}/files`, staticOpts))
   .use('/attachments', express.static(`${process.env.DB_ROOT}/attachments`, staticOpts))
   .use('/inline', express.static(`${process.env.DB_ROOT}/inline`, staticOpts))
-  .get('/random', async (req, res) => {
-    const lookupCount = await lookup.count({ service: 'patreon' });
-    const random = await lookup
-      .find({ service: 'patreon' })
-      .skip(Math.random() * lookupCount)
+  .get('/random', async (_, res) => {
+    const postsCount = await posts.countDocuments({ service: { $ne: 'discord' } });
+    const random = await posts
+      .find({ service: { $ne: 'discord' } })
+      .skip(Math.random() * postsCount)
       .limit(1)
       .toArray();
     res.setHeader('Cache-Control', 's-maxage=1, stale-while-revalidate=2592000');
-    res.redirect('/user/' + random[0].id);
+    res.redirect(path.join(
+      '/',
+      random[0].service === 'patreon' || !random[0].service ? '' : random[0].service,
+      'user', random[0].user,
+      'post', random[0].id
+    ));
   })
   .get('/api/recent', async (req, res) => {
     const recentPosts = await posts.find({ service: { $ne: 'discord' } })
@@ -43,10 +77,9 @@ express()
       .skip(Number(req.query.skip) || 0)
       .limit(Number(req.query.limit) <= 100 ? Number(req.query.limit) : 50)
       .toArray();
-    res.setHeader('Cache-Control', 's-maxage=1, stale-while-revalidate=2592000');
+    res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate=2592000');
     res.json(recentPosts);
   })
-
   .post('/api/import', async (req, res) => {
     if (!req.body.session_key) return res.sendStatus(401);
     switch (req.body.service) {
@@ -77,12 +110,15 @@ express()
     const index = await lookup
       .find({
         service: req.query.service,
-        name: { $regex: '^' + esc(req.query.q) }
+        name: {
+          $regex: esc(req.query.q),
+          $options: 'i'
+        }
       })
       .limit(Number(req.query.limit) <= 150 ? Number(req.query.limit) : 50)
       .map(user => user.id)
       .toArray();
-    res.setHeader('Cache-Control', 's-maxage=10, stale-while-revalidate=2592000');
+    res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate=2592000');
     res.json(index);
   })
   .get('/api/discord/channels/lookup', async (req, res) => {
@@ -94,13 +130,33 @@ express()
       })
       .limit(Number(req.query.limit) <= 150 ? Number(req.query.limit) : 50)
       .toArray();
-    res.setHeader('Cache-Control', 's-maxage=10, stale-while-revalidate=2592000');
+    res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate=2592000');
     res.json(index);
   })
   .get('/api/lookup/cache/:id', async (req, res) => {
     const cache = await lookup.findOne({ id: req.params.id, service: req.query.service });
-    res.setHeader('Cache-Control', 's-maxage=10, stale-while-revalidate=2592000');
-    res.send(cache.name);
+    res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate=2592000');
+    res.send(cache ? cache.name : '');
+  })
+  .get('/api/:service?/:entity/:id/lookup', async (req, res) => {
+    if (req.query.q.length > 35) return res.sendStatus(400);
+    const query = { $text: { $search: req.query.q } };
+    query[req.params.entity] = req.params.id;
+    if (!req.params.service) {
+      query.$or = [
+        { service: 'patreon' },
+        { service: { $exists: false } }
+      ];
+    } else {
+      query.service = req.params.service;
+    }
+    const userPosts = await posts.find(query)
+      .sort({ published_at: -1 })
+      .skip(Number(req.query.skip) || 0)
+      .limit(Number(req.query.limit) <= 50 ? Number(req.query.limit) : 25)
+      .toArray();
+    res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate=2592000');
+    res.json(userPosts);
   })
   .get('/api/:service?/:entity/:id', async (req, res) => {
     const query = {};
@@ -118,7 +174,26 @@ express()
       .skip(Number(req.query.skip) || 0)
       .limit(Number(req.query.limit) <= 50 ? Number(req.query.limit) : 25)
       .toArray();
-    res.setHeader('Cache-Control', 's-maxage=1, stale-while-revalidate=2592000');
+    res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate=2592000');
+    res.json(userPosts);
+  })
+  .get('/api/:service?/:entity/:id/post/:post', async (req, res) => {
+    const query = { id: req.params.post };
+    query[req.params.entity] = req.params.id;
+    if (!req.params.service) {
+      query.$or = [
+        { service: 'patreon' },
+        { service: { $exists: false } }
+      ];
+    } else {
+      query.service = req.params.service;
+    }
+    const userPosts = await posts.find(query)
+      .sort({ published_at: -1 })
+      .skip(Number(req.query.skip) || 0)
+      .limit(Number(req.query.limit) <= 50 ? Number(req.query.limit) : 25)
+      .toArray();;
+    res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate=2592000');
     res.json(userPosts);
   })
   .get('/proxy/user/:id', async (req, res) => {
@@ -207,7 +282,11 @@ express()
     res.json(index);
   })
   .get('/:service?/:type/:id', (req, res) => {
-    res.setHeader('Cache-Control', 's-maxage=1, stale-while-revalidate=2592000');
+    res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate=2592000');
     res.sendFile(path.join(__dirname, '/www/', req.params.service || '', `${req.params.type}.html`));
+  })
+  .get('/:service?/:type/:id/post/:post', (req, res) => {
+    res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate=2592000');
+    res.sendFile(path.join(__dirname, '/www/', req.params.service || '', 'post.html'));
   })
   .listen(process.env.PORT || 8000);
